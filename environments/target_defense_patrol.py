@@ -806,15 +806,15 @@ class Scenario(BaseScenario):
                 "attacker_reached_target": torch.zeros(batch_size, dtype=torch.bool, device=device),
                 "detection_reward": torch.zeros(batch_size, dtype=torch.float32, device=device),
                 "step_count": torch.zeros(batch_size, dtype=torch.long, device=device),
-                "max_steps": getattr(self, 'max_steps', 200),
+                "max_steps": torch.full((batch_size,), getattr(self, 'max_steps', 200), dtype=torch.long, device=device),
             }
-        
+
         return {
             "attacker_detected": self.attacker_detected.clone(),
             "attacker_reached_target": self.attacker_reached_target.clone(),
             "detection_reward": self.detection_reward.clone(),
             "step_count": self.step_count.clone(),
-            "max_steps": self.max_steps,
+            "max_steps": torch.full((batch_size,), self.max_steps, dtype=torch.long, device=device),
         }
 
 

@@ -1,8 +1,59 @@
 """
-Target Defense Environment V3 in VMAS
-Agents control only heading (direction) via first action dimension and always move at maximum speed
+Target Defense Environment V3 (heterogeneous defenders, multiple obstacles) in VMAS
+Agents control only heading (direction) via first action dimension and (for
+homogeneous-speed agents) always move at their own maximum speed
 Variable number of attackers and defenders with sensing-based observations
 V3: Smart Apollonius-based attacker policy when sensed
+
+multi_obs_hetero: Same idea as target_defense_smart_w_multi_obs.py (three
+obstacles: one fixed at the arena center, two placed randomly each episode),
+but:
+  - Arena defaults to the original 1x1 size (semidim 0.5), overridable via
+    the arena_semidim kwarg. It was briefly doubled (semidim 1.0) for an
+    experiment - along with max_steps, and sensing radii tuned iteratively
+    (halved, then doubled back up) - but the default has been reverted back
+    to 1x1. Obstacle radius stayed at the increased value from that
+    experiment (0.03 -> 0.06); capture_distance and target_distance are
+    unchanged from the original 1x1 version. max_steps also stayed at 2000
+    (double the original 1000) - unlike sensing/obstacle size this wasn't
+    explicitly asked to revert, so if you want it back at 1000 to match a
+    1x1 arena's actual traversal time, pass max_steps=1000 (or change the
+    default below).
+  - Exactly 3 defenders with DIFFERENT capabilities instead of 2 identical
+    ones:
+      defender_0 ("scout"):   larger sensing_radius, baseline capture_distance,
+                               slower max_speed
+      defender_1 ("sprinter"): smaller sensing_radius, baseline capture_distance,
+                               faster max_speed
+      defender_2 ("closer"):  baseline sensing_radius, larger capture_distance,
+                               baseline max_speed
+    All three are configurable via the defender_sensing_radii /
+    defender_capture_distances / defender_speed_multipliers kwargs (lists,
+    one entry per defender). The point of the environment is to see whether
+    MAPPO training discovers complementary roles (e.g. scout finds, sprinter
+    closes distance, closer finishes the capture) purely from these
+    asymmetric capabilities, with no role-specific reward shaping.
+  - Defenders spawn at an independent random x position along the bottom
+    defense line each episode (like the attacker's random spawn), instead of
+    fixed evenly-spaced positions.
+  - Obstacle contact is a manual hard-stop in post_step, exactly like
+    target_defense_smart_w_obs.py / target_defense_smart_w_multi_obs.py
+    (collision_force stays 0). An earlier version of this file tried VMAS's
+    native collision physics (collision_force > 0) for all agent/obstacle
+    contact, but it proved unstable/unreliable at this scenario's dt=1.0,
+    single-substep integration (agents move their full max_speed every step,
+    large enough to tunnel through obstacles or fling agents apart
+    explosively), so it was reverted. Agent-vs-agent contact is not
+    restricted at all, same as every other environment in this family.
+  - Defenders still observe each obstacle's position only while it is
+    within their own (individual) sensing_radius (live, non-persistent).
+  - The same per-step defender-clustering penalty is available (still
+    gated off once an attacker has been sensed), checked against each
+    defender's own sensing_radius rather than one shared value.
+  - Game-data tracking exposed via info(): which defender(s) sensed/captured
+    the attacker each episode (defender_sensed / defender_captured), and
+    cumulative distance traveled per agent (defender_distance_traveled /
+    attacker_distance_traveled).
 """
 
 import torch
@@ -31,9 +82,9 @@ except ImportError:
 
 @dataclass
 class TaskConfig:
-    """Configuration for Target Defense Smart task"""
+    """Configuration for Target Defense Smart (heterogeneous defenders, multiple obstacles) task"""
     max_steps: int = 1000
-    num_defenders: int = 1
+    num_defenders: int = 3
     num_attackers: int = 1
     sensing_radius: float = 0.3
     attacker_sensing_radius: float = 0.3
@@ -47,6 +98,15 @@ class TaskConfig:
     wall_epsilon: float = 0.03
     fixed_attacker_policy: bool = False
     use_apollonius: bool = True
+    obstacle_radius: float = 0.03
+    num_obstacles: int = 3
+    capture_distance: float = 0.07
+    defender_clustering_penalty: float = 0.002
+    obstacle_hard_stop: bool = True
+    arena_semidim: float = 0.5
+    defender_sensing_radii: Optional[List[float]] = None
+    defender_capture_distances: Optional[List[float]] = None
+    defender_speed_multipliers: Optional[List[float]] = None
 
 
 def compute_apollonius_circle(pos_a, pos_d, speed_ratio):
@@ -120,30 +180,53 @@ class Scenario(BaseScenario):
         # Extract parameters from kwargs with defaults
         num_defenders = kwargs.get('num_defenders', 3)
         num_attackers = kwargs.get('num_attackers', 1)
-        sensing_radius = kwargs.get('sensing_radius', 0.15)
-        attacker_sensing_radius = kwargs.get('attacker_sensing_radius', 0.2)
-        speed_ratio = kwargs.get('speed_ratio', 0.7)
+        sensing_radius = kwargs.get('sensing_radius', 0.3)
+        attacker_sensing_radius = kwargs.get('attacker_sensing_radius', 0.3)
+        speed_ratio = kwargs.get('speed_ratio', 0.3)
         target_distance = kwargs.get('target_distance', 0.05)
         defender_color = kwargs.get('defender_color', (0.0, 0.0, 1.0))
         attacker_color = kwargs.get('attacker_color', (1.0, 0.0, 0.0))
+        obstacle_color = kwargs.get('obstacle_color', (0.3, 0.3, 0.3))
+        obstacle_radius = kwargs.get('obstacle_radius', 0.03)
+        num_obstacles = kwargs.get('num_obstacles', 3)
+        capture_distance = kwargs.get('capture_distance', 0.07)
+        defender_clustering_penalty = kwargs.get('defender_clustering_penalty', 0.002)
         randomize_attacker_x = kwargs.get('randomize_attacker_x', False)
         fixed_attacker_policy = kwargs.get('fixed_attacker_policy', False)  # Smart policy by default
         num_spawn_positions = kwargs.get('num_spawn_positions', 3)
-        max_steps = kwargs.get('max_steps', 200)
+        max_steps = kwargs.get('max_steps', 1000)
         enable_wall_constraints = kwargs.get('enable_wall_constraints', True)
         use_apollonius = kwargs.get('use_apollonius', True)
         spawn_area_mode = kwargs.get('spawn_area_mode', False)
         spawn_area_width = kwargs.get('spawn_area_width', 0.2)
-        
+        obstacle_hard_stop = kwargs.get('obstacle_hard_stop', True)
+
+        # Heterogeneous per-defender capabilities. Index i applies to
+        # defender_i; if num_defenders differs from len(list), missing
+        # entries fall back to the homogeneous `sensing_radius` /
+        # `capture_distance` / defender_max_speed values above.
+        # Defaults: defender_0 "scout" (bigger sensing, slower), defender_1
+        # "sprinter" (smaller sensing, faster), defender_2 "closer" (bigger
+        # capture radius, baseline speed/sensing).
+        defender_sensing_radii = kwargs.get('defender_sensing_radii', [0.45, 0.18, 0.3])
+        defender_capture_distances = kwargs.get('defender_capture_distances', [0.07, 0.07, 0.105])
+        defender_speed_multipliers = kwargs.get('defender_speed_multipliers', [0.7, 1.0, 0.9])
+        defender_colors = kwargs.get(
+            'defender_colors', [(0.0, 0.5, 1.0), (0.0, 1.0, 1.0), (0.0, 0.0, 0.6)]
+        )
+
         # Generate descriptive run name for WandB
         spawn_type = "area" if spawn_area_mode else "disc"
-        run_name = f"{num_defenders}v{num_attackers}_sr{sensing_radius:.1f}_sp{speed_ratio:.1f}_{spawn_type}_smart"
-        
+        run_name = f"{num_defenders}v{num_attackers}_sr{sensing_radius:.1f}_sp{speed_ratio:.1f}_{spawn_type}_smart_multi_obs_hetero"
+
         # Print run configuration for logging
-        print(f"🎯 TARGET_DEFENSE_SMART: {run_name}")
-        print(f"   Config: {num_defenders}v{num_attackers}, sensing={sensing_radius}, speed_ratio={speed_ratio}")
+        print(f"🎯 TARGET_DEFENSE_SMART_MULTI_OBS_HETERO: {run_name}")
+        print(f"   Config: {num_defenders}v{num_attackers}, baseline sensing={sensing_radius}, speed_ratio={speed_ratio}")
         print(f"   Spawn: {spawn_type}, smart_attacker={not fixed_attacker_policy}")
-        
+        print(f"   Obstacles: {num_obstacles} (1 fixed at center, {num_obstacles - 1} random), radius={obstacle_radius}")
+        print(f"   Collision physics: OFF (collision_force=0); obstacle contact is a manual hard-stop (obstacle_hard_stop={obstacle_hard_stop})")
+        print(f"   Arena semidim: {kwargs.get('arena_semidim', 0.5)}")
+
         # Store scenario parameters
         self.batch_dim = batch_dim
         self.device = device
@@ -152,7 +235,7 @@ class Scenario(BaseScenario):
         self.num_attackers = num_attackers
         self.sensing_radius = sensing_radius
         self.attacker_sensing_radius = attacker_sensing_radius
-        self.capture_distance = 0.07
+        self.capture_distance = capture_distance
         self.speed_ratio = speed_ratio
         self.target_distance = target_distance
         self.randomize_attacker_x = randomize_attacker_x
@@ -161,51 +244,86 @@ class Scenario(BaseScenario):
         self.max_steps = max_steps
         self.spawn_area_mode = spawn_area_mode
         self.spawn_area_width = spawn_area_width
-        
-        # Speed settings
+        self.obstacle_radius = obstacle_radius
+        self.num_obstacles = max(1, num_obstacles)
+        self.defender_clustering_penalty = defender_clustering_penalty
+        self.obstacle_hard_stop = obstacle_hard_stop
+
+        # Arena semidim: defaults to 1.0 (double the size of
+        # target_defense_smart_w_obs.py), but overridable via kwarg for
+        # evaluation-time experiments (e.g. running a checkpoint trained at
+        # one arena size in a different-sized arena). _world_to_vmas /
+        # _vmas_to_world scale by this so the rest of the scenario logic
+        # (spawn fractions, target line, etc.) is unaffected either way.
+        self.arena_semidim = kwargs.get('arena_semidim', 0.5)
+
+        # Speed settings. self.defender_max_speed is the baseline; each
+        # defender's actual max_speed (used for movement in process_action)
+        # is set per-agent below via defender_speed_multipliers.
         self.defender_max_speed = 0.05
         self.attacker_max_speed = self.defender_max_speed * self.speed_ratio
-        
+
         # Near-wall constraint controls
         self.enable_wall_constraints = bool(enable_wall_constraints)
         # self.wall_epsilon = float(wall_epsilon)
-        
+
         # Apollonius solver controls
         self.use_apollonius = bool(use_apollonius) and APOLLONIUS_AVAILABLE
-        
-        # Create world - 1x1 space from 0 to 1
+
+        # Create world - collision_force back to 0, like target_defense_smart_w_obs.py
+        # / target_defense_smart_w_multi_obs.py. VMAS's native collision physics
+        # was tried here (collision_force > 0) but proved unstable/unreliable
+        # at this scenario's dt=1.0, single-substep integration (agents move
+        # their full max_speed every step, which is large enough to tunnel
+        # through obstacles or fling agents apart explosively - see git
+        # history for the abandoned attempt). Obstacle contact is instead
+        # handled by a manual hard-stop clamp in post_step, exactly as in
+        # target_defense_smart_w_obs.py. Agent-vs-agent contact is not
+        # restricted at all (agents can freely overlap), same as every other
+        # environment in this family.
         world = World(
             batch_dim=batch_dim,
             device=device,
-            x_semidim=0.5,
-            y_semidim=0.5,
+            x_semidim=self.arena_semidim,
+            y_semidim=self.arena_semidim,
             collision_force=0,
             substeps=1,
             dt=1.0
         )
-        
+
         # Store world bounds for coordinate transformation
         self.world_min = 0.0
         self.world_max = 1.0
-        
-        # Create defender agents
+
+        # Create defender agents with heterogeneous capabilities
         for i in range(num_defenders):
+            agent_sensing_radius = (
+                defender_sensing_radii[i] if i < len(defender_sensing_radii) else sensing_radius
+            )
+            agent_capture_distance = (
+                defender_capture_distances[i] if i < len(defender_capture_distances) else capture_distance
+            )
+            speed_multiplier = (
+                defender_speed_multipliers[i] if i < len(defender_speed_multipliers) else 1.0
+            )
+            agent_color = defender_colors[i] if i < len(defender_colors) else defender_color
+            agent_max_speed = self.defender_max_speed * speed_multiplier
+
             agent = Agent(
                 name=f"defender_{i}",
                 shape=Sphere(radius=0.02),
-                color=defender_color,
-                max_speed=self.defender_max_speed,
+                color=agent_color,
+                max_speed=agent_max_speed,
                 rotatable=False,
                 silent=True
             )
             agent.is_defender = True
-            agent.sensing_radius = sensing_radius
+            agent.sensing_radius = agent_sensing_radius
+            agent.capture_distance = agent_capture_distance
             world.add_agent(agent)
-        
-        # Create attacker agents. Their behavior is fully overridden by the
-        # smart Apollonius policy in process_action regardless of any incoming
-        # action, so no "controllable" flag is needed (VMAS's Agent has no such
-        # parameter - passing one raises a TypeError).
+
+        # Create attacker agents (behavior is fully overridden by the smart
+        # Apollonius policy in process_action, regardless of any incoming action)
         for i in range(num_attackers):
             agent = Agent(
                 name=f"attacker_{i}",
@@ -218,7 +336,23 @@ class Scenario(BaseScenario):
             agent.is_defender = False
             agent.sensing_radius = attacker_sensing_radius
             world.add_agent(agent)
-        
+
+        # Create obstacles: obstacle_0 stays fixed at the arena center on every
+        # reset, the rest are placed at random each reset (see reset_world_at).
+        # With collision physics on, these push back on any colliding agent
+        # via VMAS's native physics (movable=False keeps them anchored).
+        self.obstacles = []
+        for i in range(self.num_obstacles):
+            obstacle = Landmark(
+                name=f"obstacle_{i}",
+                shape=Sphere(radius=obstacle_radius),
+                color=obstacle_color,
+                collide=True,
+                movable=False,
+            )
+            world.add_landmark(obstacle)
+            self.obstacles.append(obstacle)
+
         # Initialize tracking variables
         self.attacker_sensed = torch.zeros((batch_dim, num_attackers), dtype=torch.bool, device=device)
         self.attacker_captured = torch.zeros((batch_dim, num_attackers), dtype=torch.bool, device=device)
@@ -226,6 +360,7 @@ class Scenario(BaseScenario):
         self.attacker_reached_target = torch.zeros((batch_dim, num_attackers), dtype=torch.bool, device=device)
         self.attacker_sensing_rewards = torch.zeros((batch_dim, num_attackers), device=device)
         self.defender_has_sensed = torch.zeros((batch_dim, num_defenders), dtype=torch.bool, device=device)
+        self.proximity_penalty = torch.zeros(batch_dim, device=device)
         self.step_count = torch.zeros(batch_dim, dtype=torch.long, device=device)
 
         # Per-episode game-data tracking: which defender(s) sensed/captured
@@ -240,36 +375,75 @@ class Scenario(BaseScenario):
         # Trajectory tracking for visualization
         self.max_trajectory_length = 50
         self.agent_trajectories = {}
-        
+
         return world
     
     def _world_to_vmas(self, coord):
-        """Convert world coordinates [0,1] to VMAS coordinates [-0.5,0.5]"""
+        """Convert world coordinates [0,1] to VMAS coordinates [-semidim,semidim]"""
+        scale = 2 * self.arena_semidim
         if isinstance(coord, np.ndarray):
-            return coord - 0.5
-        return coord - 0.5
-    
+            return (coord - 0.5) * scale
+        return (coord - 0.5) * scale
+
     def _vmas_to_world(self, coord):
-        """Convert VMAS coordinates [-0.5,0.5] to world coordinates [0,1]"""
+        """Convert VMAS coordinates [-semidim,semidim] to world coordinates [0,1]"""
+        scale = 2 * self.arena_semidim
         if isinstance(coord, np.ndarray):
-            return coord + 0.5
-        return coord + 0.5
-    
+            return coord / scale + 0.5
+        return coord / scale + 0.5
+
+    def _sample_obstacle_world_pos(self, placed_world_positions):
+        """
+        Sample a random world-normalized ([0,1]) position for an obstacle,
+        away from the arena edges and rejecting locations too close to
+        obstacles already placed (simple rejection sampling, gives up and
+        uses the last sample after a fixed number of tries).
+        """
+        min_sep = 2 * self.obstacle_radius / (2 * self.arena_semidim) + 0.1
+        for _ in range(50):
+            x = 0.2 + torch.rand(1).item() * 0.6
+            y = 0.2 + torch.rand(1).item() * 0.6
+            if all(math.hypot(x - px, y - py) >= min_sep for px, py in placed_world_positions):
+                return x, y
+        return x, y
+
     def reset_world_at(self, env_index: Optional[int] = None):
         """
         Reset world to initial positions
-        
+
         Args:
             env_index: Index of the environment to reset (for vectorized envs)
         """
         # Get defenders and attackers
         defenders = [a for a in self.world.agents if a.is_defender]
         attackers = [a for a in self.world.agents if not a.is_defender]
-        
+
+        # obstacle_0 stays fixed at the center of the arena; the rest are
+        # placed at random each reset, kept apart from each other.
+        if env_index is None:
+            for env_idx in range(self.batch_dim):
+                placed = [(0.5, 0.5)]
+                self.obstacles[0].state.pos[env_idx, X] = self._world_to_vmas(0.5)
+                self.obstacles[0].state.pos[env_idx, Y] = self._world_to_vmas(0.5)
+                for obstacle in self.obstacles[1:]:
+                    ox, oy = self._sample_obstacle_world_pos(placed)
+                    placed.append((ox, oy))
+                    obstacle.state.pos[env_idx, X] = self._world_to_vmas(ox)
+                    obstacle.state.pos[env_idx, Y] = self._world_to_vmas(oy)
+        else:
+            placed = [(0.5, 0.5)]
+            self.obstacles[0].state.pos[env_index, X] = self._world_to_vmas(0.5)
+            self.obstacles[0].state.pos[env_index, Y] = self._world_to_vmas(0.5)
+            for obstacle in self.obstacles[1:]:
+                ox, oy = self._sample_obstacle_world_pos(placed)
+                placed.append((ox, oy))
+                obstacle.state.pos[env_index, X] = self._world_to_vmas(ox)
+                obstacle.state.pos[env_index, Y] = self._world_to_vmas(oy)
+
         # Position defenders at independent random points along the bottom
-        # defense line (y=0), same style as the attacker's random spawn on the
-        # top line - each defender gets its own independent draw, so they are
-        # not evenly spaced or ordered by index.
+        # defense line (y=0), same style as the attacker's random spawn on
+        # the top line - each defender gets its own independent draw, so
+        # they are not evenly spaced or ordered by index.
         vmas_y = self._world_to_vmas(0.0)
         for i, defender in enumerate(defenders):
             if env_index is None:
@@ -457,16 +631,21 @@ class Scenario(BaseScenario):
             if done_mask.any():
                 for env_idx in range(batch_size):
                     env_total_reward = 0.0
-                    
+
                     if done_mask[env_idx]:
                         for a_idx in range(self.num_attackers):
                             # SMART: Reward based on CAPTURE (AC value at capture)
                             if self.attacker_captured[env_idx, a_idx]:
                                 reward_val = self.attacker_sensing_rewards[env_idx, a_idx]
                                 env_total_reward += reward_val
-                    
+
                     r[env_idx] = env_total_reward
-        
+
+            # Per-step shaping penalty for defenders clustering within each
+            # other's sensing radius while no attacker has been sensed yet
+            # (computed in update_events; zero once pursuit has started).
+            r = r + self.proximity_penalty
+
         return r
     
     def observation(self, agent: Agent) -> torch.Tensor:
@@ -479,7 +658,7 @@ class Scenario(BaseScenario):
         device = self.world.device if hasattr(self.world, 'device') else self.device
         
         if agent.is_defender:
-            obs_dim = 2 + (self.num_defenders - 1) * 2 + self.num_attackers * 2
+            obs_dim = 2 + (self.num_defenders - 1) * 2 + self.num_attackers * 2 + self.num_obstacles * 2
         else:
             obs_dim = 2 + self.num_defenders * 2
         
@@ -520,6 +699,15 @@ class Scenario(BaseScenario):
                 # Set attacker position for all environments where it's visible to ANY defender
                 obs[attacker_visible, idx:idx+2] = attacker.state.pos[attacker_visible]
                 idx += 2
+
+            # 4. Obstacles - live, per-defender sensing only (no memory, no
+            # sharing across defenders): each defender knows an obstacle's
+            # position only while it is currently within its own sensing_radius.
+            for obstacle in self.obstacles:
+                dist = torch.norm(agent.state.pos - obstacle.state.pos, dim=-1)
+                can_sense = dist <= agent.sensing_radius
+                obs[can_sense, idx:idx+2] = obstacle.state.pos[can_sense]
+                idx += 2
         else:
             # For attackers: observe all defenders if within their own sensing radius
             for defender in defenders:
@@ -550,62 +738,80 @@ class Scenario(BaseScenario):
         
         defenders = [a for a in self.world.agents if a.is_defender]
         attackers = [a for a in self.world.agents if not a.is_defender]
-        
-        # SMART VERSION: First check sensing (at 0.3 radius)
+
+        # Defender-defender clustering penalty: discourage defenders from
+        # sitting within each other's sensing radius while still searching,
+        # but not once an attacker has been sensed (they should be free to
+        # converge together to pursue it). Uses the larger of the pair's two
+        # (possibly different) sensing radii, so "in each other's sensing
+        # radius" fires as soon as either one would detect the other.
+        self.proximity_penalty = torch.zeros(batch_size, device=device)
+        any_sensed = self.attacker_sensed.any(dim=1)
+        for i in range(len(defenders)):
+            for j in range(i + 1, len(defenders)):
+                pair_dist = torch.norm(defenders[i].state.pos - defenders[j].state.pos, dim=-1)
+                pair_sensing_radius = max(defenders[i].sensing_radius, defenders[j].sensing_radius)
+                too_close = (pair_dist <= pair_sensing_radius) & ~any_sensed
+                self.proximity_penalty = self.proximity_penalty - too_close.float() * self.defender_clustering_penalty
+
+        # SMART VERSION: First check sensing (each defender uses its own,
+        # possibly heterogeneous, sensing_radius)
         for attacker_idx, attacker in enumerate(attackers):
             for defender_idx, defender in enumerate(defenders):
                 dist = torch.norm(attacker.state.pos - defender.state.pos, dim=-1)
                 self.distances[:, defender_idx, attacker_idx] = dist
-                
-                # SENSING EVENT (at sensing_radius)
-                newly_sensed = (dist <= self.sensing_radius) & ~self.attacker_sensed[:, attacker_idx]
-                
+
+                # SENSING EVENT (at this defender's own sensing_radius)
+                newly_sensed = (dist <= defender.sensing_radius) & ~self.attacker_sensed[:, attacker_idx]
+
                 if newly_sensed.any():
                     self.defender_has_sensed[:, defender_idx] |= newly_sensed
-                    
+
                     for env_idx in torch.where(newly_sensed)[0]:
                         def_pos = defender.state.pos[env_idx]
                         att_pos = attacker.state.pos[env_idx]
-                        
+
                         # Snap to sensing boundary
                         direction = att_pos - def_pos
                         direction_norm = torch.norm(direction)
-                        
-                        if direction_norm < self.sensing_radius and direction_norm > 0:
+
+                        if direction_norm < defender.sensing_radius and direction_norm > 0:
                             direction_normalized = direction / direction_norm
-                            attacker.state.pos[env_idx] = def_pos + direction_normalized * self.sensing_radius
-                        
+                            attacker.state.pos[env_idx] = def_pos + direction_normalized * defender.sensing_radius
+
                         # Don't stop velocity - smart attacker continues with Nash policy
-                    
+
                     self.attacker_sensed[:, attacker_idx] |= newly_sensed
-        
-        # SMART VERSION: Check for capture (at capture_distance) - separate from sensing
+
+        # SMART VERSION: Check for capture (each defender uses its own,
+        # possibly heterogeneous, capture_distance) - separate from sensing
         for attacker_idx, attacker in enumerate(attackers):
             for defender_idx, defender in enumerate(defenders):
                 dist = torch.norm(attacker.state.pos - defender.state.pos, dim=-1)
-                
-                # CAPTURE EVENT (at capture_distance, only after sensing)
+
+                # CAPTURE EVENT (at this defender's own capture_distance, only after sensing)
                 can_capture = self.attacker_sensed[:, attacker_idx]  # Must be sensed first
-                newly_captured = (dist <= self.capture_distance) & can_capture & ~self.attacker_captured[:, attacker_idx]
-                
+                newly_captured = (dist <= defender.capture_distance) & can_capture & ~self.attacker_captured[:, attacker_idx]
+
                 if newly_captured.any():
                     self.defender_has_captured[:, defender_idx] |= newly_captured
                     for env_idx in torch.where(newly_captured)[0]:
-                        # COMPUTE AC REWARD AT CAPTURE (Smart version)
+                        # COMPUTE AC REWARD AT CAPTURE (Smart version). Uses
+                        # only the capturing defender's own position/speed -
+                        # the classic multi-pursuer Apollonius solve assumes
+                        # one shared pursuer speed, which no longer holds
+                        # with heterogeneous defender speeds.
                         if self.use_apollonius:
                             attacker_pos_vmas = attacker.state.pos[env_idx].cpu().numpy()
                             attacker_pos = self._vmas_to_world(attacker_pos_vmas)
-                            
-                            defender_positions = []
-                            for def_agent in defenders:
-                                defender_pos_vmas = def_agent.state.pos[env_idx].cpu().numpy()
-                                defender_pos_global = self._vmas_to_world(defender_pos_vmas)
-                                defender_positions.append(defender_pos_global)
-                            
+
+                            defender_pos_vmas = defender.state.pos[env_idx].cpu().numpy()
+                            defender_pos_global = self._vmas_to_world(defender_pos_vmas)
+
                             result = solve_apollonius_optimization(
                                 attacker_pos=attacker_pos,
-                                defender_positions=defender_positions,
-                                nu=1.0 / self.speed_ratio
+                                defender_positions=[defender_pos_global],
+                                nu=defender.max_speed / self.attacker_max_speed
                             )
                             
                             if result['success']:
@@ -668,26 +874,28 @@ class Scenario(BaseScenario):
                     attacker_pos_vmas = attacker.state.pos[env_idx].cpu().numpy()
                     attacker_pos_world = self._vmas_to_world(attacker_pos_vmas)
                     
-                    # Find all defenders that can currently see this attacker
+                    # Find all defenders that can currently see this attacker,
+                    # paired with each one's own speed ratio (heterogeneous
+                    # defender speeds mean this can differ per defender).
                     sensing_defenders = []
                     for defender in defenders:
                         defender_pos_vmas = defender.state.pos[env_idx].cpu().numpy()
                         defender_pos_world = self._vmas_to_world(defender_pos_vmas)
-                        
-                        dist = np.linalg.norm(attacker_pos_world - defender_pos_world)
+
                         # Include all defenders that have sensed (not just currently in range)
                         if self.attacker_sensed[env_idx, attacker_idx]:
-                            sensing_defenders.append(defender_pos_world)
-                    
+                            defender_speed_ratio = self.attacker_max_speed / defender.max_speed
+                            sensing_defenders.append((defender_pos_world, defender_speed_ratio))
+
                     if sensing_defenders:
                         lowest_points = []
-                        
-                        for defender_pos in sensing_defenders:
+
+                        for defender_pos, defender_speed_ratio in sensing_defenders:
                             try:
                                 center, radius, lowest_point = compute_apollonius_circle(
                                     pos_a=attacker_pos_world,
                                     pos_d=defender_pos,
-                                    speed_ratio=self.speed_ratio
+                                    speed_ratio=defender_speed_ratio
                                 )
                                 lowest_points.append(lowest_point)
                             except (ValueError, ZeroDivisionError):
@@ -788,8 +996,9 @@ class Scenario(BaseScenario):
         if agent.is_defender and hasattr(self, '_apply_wall_constraints'):
             theta = self._apply_wall_constraints(agent, theta)
         
-        # Determine speed
-        max_speed = self.attacker_max_speed if not agent.is_defender else self.defender_max_speed
+        # Determine speed - defenders use their own (possibly heterogeneous)
+        # max_speed set at creation, not a shared scenario-wide value
+        max_speed = self.attacker_max_speed if not agent.is_defender else agent.max_speed
         
         # For defenders in Smart environment, they continue moving after sensing to learn pursuit
         if agent.is_defender and hasattr(self, 'defender_has_sensed'):
@@ -881,12 +1090,49 @@ class Scenario(BaseScenario):
     def post_step(self):
         """
         Called once per environment step, after the world has integrated
-        positions. Accumulates distance traveled per agent, using each
-        agent's current position vs. its position snapshotted at the end of
-        the previous post_step (or at episode reset).
+        positions. Two things happen here, in order:
+
+        1. Obstacle hard-stop (same mechanism as target_defense_smart_w_obs.py
+           / target_defense_smart_w_multi_obs.py, restored after an abandoned
+           attempt at using VMAS's native collision physics - see the
+           comment in make_world's World(...) construction). Any agent
+           (defender or attacker) that penetrated an obstacle this step is
+           pushed back out to sit exactly on its boundary, velocity zeroed.
+           Agent-vs-agent contact is NOT restricted at all.
+        2. Distance-traveled accumulation, using each agent's (possibly
+           just-clamped) position vs. its position snapshotted at the end of
+           the previous post_step (or at episode reset).
         """
         defenders = [a for a in self.world.agents if a.is_defender]
         attackers = [a for a in self.world.agents if not a.is_defender]
+
+        if self.obstacle_hard_stop:
+            for obstacle in self.obstacles:
+                obstacle_pos = obstacle.state.pos  # [batch, 2]
+
+                for agent in self.world.agents:
+                    agent_radius = getattr(agent.shape, "radius", 0.02)
+                    min_dist = self.obstacle_radius + agent_radius
+
+                    delta = agent.state.pos - obstacle_pos
+                    dist = torch.norm(delta, dim=-1)
+                    penetrating = dist < min_dist
+
+                    if not penetrating.any():
+                        continue
+
+                    # Avoid division by zero for the (unlikely) case of an
+                    # agent sitting exactly on the obstacle center; push it
+                    # straight up.
+                    safe_dist = torch.clamp(dist, min=1e-6)
+                    direction = delta / safe_dist.unsqueeze(-1)
+                    centered = dist < 1e-6
+                    if centered.any():
+                        direction[centered] = torch.tensor([0.0, 1.0], device=self.device)
+
+                    clamped_pos = obstacle_pos + direction * min_dist
+                    agent.state.pos[penetrating] = clamped_pos[penetrating]
+                    agent.state.vel[penetrating] = 0.0
 
         for i, defender in enumerate(defenders):
             prev_pos = self._prev_positions.get(defender.name)
@@ -936,7 +1182,7 @@ class Scenario(BaseScenario):
                 "defender_distance_traveled": torch.zeros((batch_size, self.num_defenders), device=device),
                 "attacker_distance_traveled": torch.zeros((batch_size, self.num_attackers), device=device),
             }
-        
+
         return {
             "attackers_sensed": self.attacker_sensed.clone(),
             "attackers_captured": self.attacker_captured.clone(),
@@ -947,9 +1193,9 @@ class Scenario(BaseScenario):
             "capture_occurred": self.attacker_captured.any(dim=1),
             "interception_occurred": self.attacker_intercepted.any(dim=1),
             "target_reached": self.attacker_reached_target.any(dim=1),
-            # Per-episode game data: which defender(s) sensed/captured the
-            # attacker this episode, and cumulative distance traveled per
-            # agent so far.
+            # Game data requested for the heterogeneous-roles experiment:
+            # which defender(s) sensed/captured the attacker this episode,
+            # and cumulative distance traveled per agent so far.
             "defender_sensed": self.defender_has_sensed.clone(),
             "defender_captured": self.defender_has_captured.clone(),
             "defender_distance_traveled": self.defender_distance_traveled.clone(),
@@ -968,38 +1214,39 @@ class Scenario(BaseScenario):
         all_agents = defenders + attackers
         
         # 1. BLACK WALLS
+        s = self.arena_semidim
         wall_lines = [
-            ((-0.5, -0.5), (-0.5, 0.5)),
-            ((0.5, -0.5), (0.5, 0.5)),
-            ((-0.5, 0.5), (0.5, 0.5)),
+            ((-s, -s), (-s, s)),
+            ((s, -s), (s, s)),
+            ((-s, s), (s, s)),
         ]
-        
+
         for start, end in wall_lines:
             wall = rendering.Line(start, end, width=8)
             wall_xform = rendering.Transform()
             wall.add_attr(wall_xform)
             wall.set_color(*Color.BLACK.value)
             geoms.append(wall)
-        
+
         # 2. GREEN TARGET LINE
-        target_line = rendering.Line((-0.5, -0.5), (0.5, -0.5), width=10)
+        target_line = rendering.Line((-s, -s), (s, -s), width=10)
         target_xform = rendering.Transform()
         target_line.add_attr(target_xform)
         target_line.set_color(*Color.GREEN.value)
         geoms.append(target_line)
         
-        # 3. SENSING AND CAPTURE CIRCLES
+        # 3. SENSING AND CAPTURE CIRCLES (each defender's own, heterogeneous, radii)
         for defender in defenders:
             pos = defender.state.pos[env_index]
-            
-            sensing_circle = rendering.make_circle(self.sensing_radius, filled=False)
+
+            sensing_circle = rendering.make_circle(defender.sensing_radius, filled=False)
             sensing_xform = rendering.Transform()
             sensing_xform.set_translation(*pos.cpu().numpy())
             sensing_circle.add_attr(sensing_xform)
             sensing_circle.set_color(0.0, 0.0, 1.0, 0.6)
             geoms.append(sensing_circle)
-            
-            capture_circle = rendering.make_circle(self.capture_distance, filled=False)
+
+            capture_circle = rendering.make_circle(defender.capture_distance, filled=False)
             capture_xform = rendering.Transform()
             capture_xform.set_translation(*pos.cpu().numpy())
             capture_circle.add_attr(capture_xform)
@@ -1008,11 +1255,11 @@ class Scenario(BaseScenario):
         
         # 4. SPAWN AREA
         if hasattr(self, 'spawn_area_mode') and self.spawn_area_mode:
-            spawn_min_vmas = 0.5 - self.spawn_area_width
-            
+            spawn_min_vmas = self._world_to_vmas(1.0 - self.spawn_area_width)
+
             spawn_borders = [
-                rendering.Line((-0.5, 0.5), (0.5, 0.5), width=6),
-                rendering.Line((-0.5, spawn_min_vmas), (0.5, spawn_min_vmas), width=6),
+                rendering.Line((-s, s), (s, s), width=6),
+                rendering.Line((-s, spawn_min_vmas), (s, spawn_min_vmas), width=6),
             ]
             for border in spawn_borders:
                 border_xform = rendering.Transform()
@@ -1123,12 +1370,12 @@ class Scenario(BaseScenario):
                             defender_pos_world = self._vmas_to_world(defender_pos_vmas)
                             
                             dist = np.linalg.norm(attacker_pos_world - defender_pos_world)
-                            if dist <= self.sensing_radius + 0.1:
+                            if dist <= defender.sensing_radius + 0.1:
                                 try:
                                     center, radius, lowest_point = compute_apollonius_circle(
                                         pos_a=attacker_pos_world,
                                         pos_d=defender_pos_world,
-                                        speed_ratio=self.speed_ratio
+                                        speed_ratio=self.attacker_max_speed / defender.max_speed
                                     )
                                     
                                     # Draw Apollonius circle
@@ -1172,31 +1419,45 @@ if __name__ == "__main__":
     import vmas
     
     scenario = Scenario()
-    
-    # Test with smart attacker policy
+
+    # Test with smart attacker policy, three heterogeneous defenders, three
+    # obstacles, double-size arena, reduced sensing, manual obstacle hard-stop
     env = vmas.make_env(
         scenario=scenario,
         num_envs=2,
         device="cpu",
         continuous_actions=True,
-        num_defenders=1,
+        num_defenders=3,
         num_attackers=1,
         sensing_radius=0.3,
         speed_ratio=0.3,
         fixed_attacker_policy=False,  # Smart policy enabled
         spawn_area_mode=True,
-        spawn_area_width=0.1
+        spawn_area_width=0.1,
+        obstacle_radius=0.06,
+        num_obstacles=3,
+        capture_distance=0.07,
+        max_steps=2000,
     )
-    
-    print(f"V3 Environment created with {env.n_agents} agents")
+
+    print(f"V3 (multi_obs_hetero) Environment created with {env.n_agents} agents")
     print(f"Smart attacker policy: {not scenario.fixed_attacker_policy}")
-    print(f"Sensing radius: {scenario.sensing_radius}")
-    print(f"Capture distance: {scenario.capture_distance}")
-    print("V3 Features:")
+    print(f"Obstacle radius: {scenario.obstacle_radius}, count: {scenario.num_obstacles}")
+    print(f"Arena semidim: {scenario.arena_semidim}")
+    defenders = [a for a in env.world.agents if a.is_defender]
+    for d in defenders:
+        print(f"  {d.name}: sensing_radius={d.sensing_radius}, capture_distance={d.capture_distance}, max_speed={d.max_speed}")
+    print("V3 (multi_obs_hetero) Features:")
     print("  - Attackers use Apollonius circle feedback loop when sensed")
     print("  - Attackers move straight down when not sensed")
     print("  - Dynamic escape route computation every step")
-    
+    print("  - Three defenders with heterogeneous sensing/capture/speed")
+    print("  - Three obstacles (one fixed at center, two random per episode)")
+    print("  - Defenders sense obstacles live, within their own sensing_radius")
+    print("  - Defenders penalized for clustering unless pursuing an attacker")
+    print("  - Obstacle contact is a manual hard-stop (collision_force stays 0)")
+    print("  - Defenders spawn at independent random points on the defense line")
+
     obs = env.reset()
     print(f"Initial observations shape: {[o.shape for o in obs]}")
-    print("\n✓ V3 Environment with smart Apollonius-based attackers ready!")
+    print("\n✓ V3 (multi_obs_hetero) Environment ready!")

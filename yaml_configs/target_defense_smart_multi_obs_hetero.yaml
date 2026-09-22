@@ -1,0 +1,31 @@
+# benchmarl/conf/task/vmas/target_defense_smart_multi_obs_hetero.yaml
+# Same base scale as target_defense_smart_w_obs.yaml (1x1 arena), extended
+# with 3 obstacles (like target_defense_smart_w_multi_obs) and 3 defenders
+# with heterogeneous capabilities instead of N identical ones.
+max_steps: 1000
+num_defenders: 3
+num_attackers: 1
+sensing_radius: 0.3
+attacker_sensing_radius: 0.3
+speed_ratio: 0.3
+target_distance: 0.05
+randomize_attacker_x: true
+num_spawn_positions: 0
+spawn_area_mode: true
+spawn_area_width: 0.1
+enable_wall_constraints: false
+wall_epsilon: 0.03
+fixed_attacker_policy: false
+use_apollonius: true
+obstacle_radius: 0.03
+num_obstacles: 3
+capture_distance: 0.07
+defender_clustering_penalty: 0.002
+
+# Heterogeneous per-defender capabilities (index i -> defender_i):
+# defender_0 "scout":    larger sensing_radius, baseline capture_distance, slower
+# defender_1 "sprinter": smaller sensing_radius, baseline capture_distance, faster
+# defender_2 "closer":   baseline sensing_radius, larger capture_distance, baseline speed
+defender_sensing_radii: [0.45, 0.18, 0.3]
+defender_capture_distances: [0.07, 0.07, 0.105]
+defender_speed_multipliers: [0.7, 1.5, 1.0]

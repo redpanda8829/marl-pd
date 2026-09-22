@@ -249,7 +249,20 @@ class Scenario(BaseScenario):
         self.attacker_reached_target = torch.zeros((batch_dim, num_attackers), dtype=torch.bool, device=device)
         self.attacker_sensing_rewards = torch.zeros((batch_dim, num_attackers), device=device)
         self.defender_has_sensed = torch.zeros((batch_dim, num_defenders), dtype=torch.bool, device=device)
-        
+
+        # Per-episode game-data tracking: which defender(s) sensed/captured
+        # the attacker, and how far each agent has traveled. Exposed via
+        # info() so they show up as loggable metrics (same mechanism as the
+        # existing attacker_sensed/attacker_intercepted fields).
+        # NOTE: this scenario has no capture concept (episodes end on
+        # SENSING), so defender_has_captured is created and reported for
+        # schema consistency with the other curriculum stages but stays
+        # all-False here.
+        self.defender_has_captured = torch.zeros((batch_dim, num_defenders), dtype=torch.bool, device=device)
+        self.defender_distance_traveled = torch.zeros((batch_dim, num_defenders), device=device)
+        self.attacker_distance_traveled = torch.zeros((batch_dim, num_attackers), device=device)
+        self._prev_positions = {}
+
         # Step tracking for max_steps termination
         self.step_count = torch.zeros(batch_dim, dtype=torch.long, device=device)
         
@@ -282,18 +295,22 @@ class Scenario(BaseScenario):
         defenders = [a for a in self.world.agents if a.is_defender]
         attackers = [a for a in self.world.agents if not a.is_defender]
         
-        # Position defenders evenly along bottom edge (world coordinates [0,1])
-        defender_spacing = 1.0 / (self.num_defenders + 1)
+        # Position defenders at independent random points along the bottom
+        # defense line (y=0), same style as the attacker's random spawn on the
+        # top line - each defender gets its own independent draw, so they are
+        # not evenly spaced or ordered by index.
+        vmas_y = self._world_to_vmas(0.0)
         for i, defender in enumerate(defenders):
-            world_x = (i + 1) * defender_spacing  # x position in [0,1] world coordinates
-            vmas_x = self._world_to_vmas(world_x)  # Convert to VMAS [-0.5, 0.5]
-            vmas_y = self._world_to_vmas(0.0)      # Bottom edge = y=0 in world = y=-0.5 in VMAS
-            
             if env_index is None:
+                batch_size = self.batch_dim
+                world_x = 0.1 + torch.rand(batch_size, device=self.device) * 0.8
+                vmas_x = self._world_to_vmas(world_x)
                 defender.state.pos[:, X] = vmas_x
                 defender.state.pos[:, Y] = vmas_y
                 defender.state.vel[:, :] = 0
             else:
+                world_x = 0.1 + torch.rand(1, device=self.device).item() * 0.8
+                vmas_x = self._world_to_vmas(world_x)
                 defender.state.pos[env_index, X] = vmas_x
                 defender.state.pos[env_index, Y] = vmas_y
                 defender.state.vel[env_index, :] = 0
@@ -433,6 +450,9 @@ class Scenario(BaseScenario):
             self.defender_has_sensed = torch.zeros((batch_size, self.num_defenders), dtype=torch.bool, device=device)
             self.distances = torch.zeros((batch_size, self.num_defenders, self.num_attackers), device=device)
             self.step_count = torch.zeros(batch_size, dtype=torch.long, device=device)
+            self.defender_has_captured = torch.zeros((batch_size, self.num_defenders), dtype=torch.bool, device=device)
+            self.defender_distance_traveled = torch.zeros((batch_size, self.num_defenders), device=device)
+            self.attacker_distance_traveled = torch.zeros((batch_size, self.num_attackers), device=device)
         else:
             self.attacker_sensed[env_index, :] = False
             self.attacker_intercepted[env_index, :] = False
@@ -444,7 +464,24 @@ class Scenario(BaseScenario):
                 self.distances[env_index, :, :] = 0.0
             if hasattr(self, 'step_count'):
                 self.step_count[env_index] = 0
-        
+            if hasattr(self, 'defender_has_captured'):
+                self.defender_has_captured[env_index, :] = False
+            if hasattr(self, 'defender_distance_traveled'):
+                self.defender_distance_traveled[env_index, :] = 0.0
+            if hasattr(self, 'attacker_distance_traveled'):
+                self.attacker_distance_traveled[env_index, :] = 0.0
+
+        # Snapshot post-spawn positions so the first post_step() call
+        # measures distance traveled from the spawn point, not from
+        # whatever the agent's position was before this reset.
+        for agent in self.world.agents:
+            if agent.name not in self._prev_positions:
+                self._prev_positions[agent.name] = agent.state.pos.clone()
+            elif env_index is None:
+                self._prev_positions[agent.name] = agent.state.pos.clone()
+            else:
+                self._prev_positions[agent.name][env_index] = agent.state.pos[env_index].clone()
+
         # Reset step-based flags
         self._events_updated_this_step = False
         self._step_incremented_this_step = False
@@ -778,7 +815,10 @@ class Scenario(BaseScenario):
                 # When sensing occurs, snap attacker to boundary and compute rewards/interception
                 if newly_sensed.any():
                     # Removed defender marking - keep defenders active
-                    
+                    # Record WHICH defender did the sensing (metrics only -
+                    # does not deactivate the defender).
+                    self.defender_has_sensed[:, defender_idx] |= newly_sensed
+
                     # Snap attacker position to the sensing boundary
                     for env_idx in torch.where(newly_sensed)[0]:
                         def_pos = defender.state.pos[env_idx]
@@ -985,7 +1025,29 @@ class Scenario(BaseScenario):
         # Keep only recent positions (sliding window)
         if len(self.agent_trajectories[agent.name]) > self.max_trajectory_length:
             self.agent_trajectories[agent.name] = self.agent_trajectories[agent.name][-self.max_trajectory_length:]
-    
+
+    def post_step(self):
+        """
+        Called once per environment step, after the world has integrated
+        positions. Accumulates distance traveled per agent, using each
+        agent's current position vs. its position snapshotted at the end of
+        the previous post_step (or at episode reset).
+        """
+        defenders = [a for a in self.world.agents if a.is_defender]
+        attackers = [a for a in self.world.agents if not a.is_defender]
+
+        for i, defender in enumerate(defenders):
+            prev_pos = self._prev_positions.get(defender.name)
+            if prev_pos is not None:
+                self.defender_distance_traveled[:, i] += torch.norm(defender.state.pos - prev_pos, dim=-1)
+            self._prev_positions[defender.name] = defender.state.pos.clone()
+
+        for i, attacker in enumerate(attackers):
+            prev_pos = self._prev_positions.get(attacker.name)
+            if prev_pos is not None:
+                self.attacker_distance_traveled[:, i] += torch.norm(attacker.state.pos - prev_pos, dim=-1)
+            self._prev_positions[attacker.name] = attacker.state.pos.clone()
+
     def done(self) -> torch.Tensor:
         """
         Check if episodes are done
@@ -1030,7 +1092,11 @@ class Scenario(BaseScenario):
                 # Aggregate info for backward compatibility
                 "sensing_occurred": torch.zeros(batch_size, dtype=torch.bool, device=device),
                 "interception_occurred": torch.zeros(batch_size, dtype=torch.bool, device=device),
-                "target_reached": torch.zeros(batch_size, dtype=torch.bool, device=device)
+                "target_reached": torch.zeros(batch_size, dtype=torch.bool, device=device),
+                "defender_sensed": torch.zeros((batch_size, self.num_defenders), dtype=torch.bool, device=device),
+                "defender_captured": torch.zeros((batch_size, self.num_defenders), dtype=torch.bool, device=device),
+                "defender_distance_traveled": torch.zeros((batch_size, self.num_defenders), device=device),
+                "attacker_distance_traveled": torch.zeros((batch_size, self.num_attackers), device=device),
             }
         
         return {
@@ -1041,7 +1107,14 @@ class Scenario(BaseScenario):
             # Aggregate info for backward compatibility
             "sensing_occurred": self.attacker_sensed.any(dim=1),
             "interception_occurred": self.attacker_intercepted.any(dim=1),
-            "target_reached": self.attacker_reached_target.any(dim=1)
+            "target_reached": self.attacker_reached_target.any(dim=1),
+            # Per-episode game data (same schema as the later curriculum
+            # stages). This scenario has no capture concept, so
+            # defender_captured is always all-False here.
+            "defender_sensed": self.defender_has_sensed.clone(),
+            "defender_captured": self.defender_has_captured.clone(),
+            "defender_distance_traveled": self.defender_distance_traveled.clone(),
+            "attacker_distance_traveled": self.attacker_distance_traveled.clone(),
         }
 
 

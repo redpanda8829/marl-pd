@@ -748,7 +748,7 @@ class Scenario(BaseScenario):
                 "attacker_reached_target": torch.zeros((batch_size, self.num_attackers), dtype=torch.bool, device=device),
                 "detection_reward": torch.zeros((batch_size, self.num_attackers), dtype=torch.float32, device=device),
                 "step_count": torch.zeros(batch_size, dtype=torch.long, device=device),
-                "max_steps": torch.tensor(getattr(self, 'max_steps', 200), device=device),
+                "max_steps": torch.full((batch_size,), getattr(self, 'max_steps', 200), device=device),
             }
 
         return {
@@ -756,7 +756,7 @@ class Scenario(BaseScenario):
             "attacker_reached_target": self.attacker_reached_target.clone(),
             "detection_reward": self.detection_reward.clone(),
             "step_count": self.step_count.clone(),
-            "max_steps": torch.tensor(self.max_steps, device=device),
+            "max_steps": torch.full_like(self.step_count, self.max_steps),
         }
 
 

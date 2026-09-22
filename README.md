@@ -31,39 +31,45 @@ This repository contains custom VMAS environments for target defense scenarios w
 
 ## Installation
 
-### Prerequisites
+Two scripts handle the whole setup: one installs the Python/conda stack, the
+other deploys this repo's custom scenarios into it.
+
+### 1. Clone this repository
 ```bash
-# Install BenchMARL
-pip install benchmarl
-
-# Install VMAS
-pip install vmas
-
-# Install additional dependencies
-pip install cvxpy torch torchrl tensordict
+git clone <this-repo-url> marl-pd
+cd marl-pd
 ```
 
-### Setup
-1. Clone this repository:
+### 2. Install Miniconda and the `marl` conda environment
 ```bash
-git clone https://github.com/das-goutam/benchmarl-target-defense.git
-cd benchmarl-target-defense
+./setup_environment.sh          # CPU build of torch (default)
+./setup_environment.sh cu121    # or pass a CUDA variant instead
 ```
+This script is self-contained — it doesn't read anything from the repo. It
+installs Miniconda if it isn't already present, creates the `marl` conda
+environment (Python 3.10), and installs the pinned package versions this
+project was developed against: torch, torchrl, tensordict, benchmarl, vmas,
+cvxpy, hydra-core, pyglet, av (mp4 video export), matplotlib, and friends.
 
-2. Copy the environment files to your BenchMARL installation:
+If this is the first time Miniconda was installed on this machine, open a new
+terminal (or `source ~/miniconda3/etc/profile.d/conda.sh`) before the
+`conda activate` step below.
+
+### 3. Deploy the custom scenarios
 ```bash
-# Find your BenchMARL installation path
-python -c "import benchmarl; print(benchmarl.__path__[0])"
-
-# Copy environments
-cp environments/*.py <benchmarl_path>/environments/vmas/
-
-# Copy YAML configs
-cp yaml_configs/*.yaml <benchmarl_path>/conf/task/vmas/
-
-# Copy Apollonius solver
-cp apollonius_solver.py <your_project_directory>/
+conda activate marl
+./deploy_scenarios.sh
 ```
+A plain `pip install vmas benchmarl` gives you none of the environments in
+this repo. VMAS loads scenarios by walking its own `vmas/scenarios/`
+directory, and BenchMARL looks tasks up in a hardcoded enum. This script
+copies `environments/*.py` and `yaml_configs/*.yaml` into the installed
+packages, registers the `TARGET_DEFENSE_*` tasks in BenchMARL, and verifies
+that every scenario loads.
+
+Re-run `./deploy_scenarios.sh` any time you edit files under `environments/`
+or `yaml_configs/` — the libraries execute their own copies under
+site-packages, not the ones in this repo.
 
 ## Usage
 

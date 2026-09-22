@@ -1,8 +1,12 @@
 """
-Target Defense Environment V3 in VMAS
+Target Defense Environment V3 (with obstacle) in VMAS
 Agents control only heading (direction) via first action dimension and always move at maximum speed
 Variable number of attackers and defenders with sensing-based observations
 V3: Smart Apollonius-based attacker policy when sensed
+w_obs: Same as target_defense_smart.py, plus a small static obstacle at the
+center of the arena and a second defender (both defenders can sense and pursue).
+The obstacle hard-stops any agent (defender or attacker) that tries to move
+into it (see post_step) - it is a restricted area, not just a visual marker.
 """
 
 import torch
@@ -31,9 +35,9 @@ except ImportError:
 
 @dataclass
 class TaskConfig:
-    """Configuration for Target Defense Smart task"""
+    """Configuration for Target Defense Smart (with obstacle) task"""
     max_steps: int = 1000
-    num_defenders: int = 1
+    num_defenders: int = 2
     num_attackers: int = 1
     sensing_radius: float = 0.3
     attacker_sensing_radius: float = 0.3
@@ -47,6 +51,7 @@ class TaskConfig:
     wall_epsilon: float = 0.03
     fixed_attacker_policy: bool = False
     use_apollonius: bool = True
+    obstacle_radius: float = 0.03
 
 
 def compute_apollonius_circle(pos_a, pos_d, speed_ratio):
@@ -118,7 +123,7 @@ class Scenario(BaseScenario):
             World: The created VMAS world
         """
         # Extract parameters from kwargs with defaults
-        num_defenders = kwargs.get('num_defenders', 3)
+        num_defenders = kwargs.get('num_defenders', 2)
         num_attackers = kwargs.get('num_attackers', 1)
         sensing_radius = kwargs.get('sensing_radius', 0.15)
         attacker_sensing_radius = kwargs.get('attacker_sensing_radius', 0.2)
@@ -126,6 +131,8 @@ class Scenario(BaseScenario):
         target_distance = kwargs.get('target_distance', 0.05)
         defender_color = kwargs.get('defender_color', (0.0, 0.0, 1.0))
         attacker_color = kwargs.get('attacker_color', (1.0, 0.0, 0.0))
+        obstacle_color = kwargs.get('obstacle_color', (0.3, 0.3, 0.3))
+        obstacle_radius = kwargs.get('obstacle_radius', 0.03)
         randomize_attacker_x = kwargs.get('randomize_attacker_x', False)
         fixed_attacker_policy = kwargs.get('fixed_attacker_policy', False)  # Smart policy by default
         num_spawn_positions = kwargs.get('num_spawn_positions', 3)
@@ -134,15 +141,16 @@ class Scenario(BaseScenario):
         use_apollonius = kwargs.get('use_apollonius', True)
         spawn_area_mode = kwargs.get('spawn_area_mode', False)
         spawn_area_width = kwargs.get('spawn_area_width', 0.2)
-        
+
         # Generate descriptive run name for WandB
         spawn_type = "area" if spawn_area_mode else "disc"
-        run_name = f"{num_defenders}v{num_attackers}_sr{sensing_radius:.1f}_sp{speed_ratio:.1f}_{spawn_type}_smart"
-        
+        run_name = f"{num_defenders}v{num_attackers}_sr{sensing_radius:.1f}_sp{speed_ratio:.1f}_{spawn_type}_smart_w_obs"
+
         # Print run configuration for logging
-        print(f"🎯 TARGET_DEFENSE_SMART: {run_name}")
+        print(f"🎯 TARGET_DEFENSE_SMART_W_OBS: {run_name}")
         print(f"   Config: {num_defenders}v{num_attackers}, sensing={sensing_radius}, speed_ratio={speed_ratio}")
         print(f"   Spawn: {spawn_type}, smart_attacker={not fixed_attacker_policy}")
+        print(f"   Obstacle: radius={obstacle_radius} at center")
         
         # Store scenario parameters
         self.batch_dim = batch_dim
@@ -161,7 +169,8 @@ class Scenario(BaseScenario):
         self.max_steps = max_steps
         self.spawn_area_mode = spawn_area_mode
         self.spawn_area_width = spawn_area_width
-        
+        self.obstacle_radius = obstacle_radius
+
         # Speed settings
         self.defender_max_speed = 0.05
         self.attacker_max_speed = self.defender_max_speed * self.speed_ratio
@@ -202,10 +211,8 @@ class Scenario(BaseScenario):
             agent.sensing_radius = sensing_radius
             world.add_agent(agent)
         
-        # Create attacker agents. Their behavior is fully overridden by the
-        # smart Apollonius policy in process_action regardless of any incoming
-        # action, so no "controllable" flag is needed (VMAS's Agent has no such
-        # parameter - passing one raises a TypeError).
+        # Create attacker agents (behavior is fully overridden by the smart
+        # Apollonius policy in process_action, regardless of any incoming action)
         for i in range(num_attackers):
             agent = Agent(
                 name=f"attacker_{i}",
@@ -218,7 +225,18 @@ class Scenario(BaseScenario):
             agent.is_defender = False
             agent.sensing_radius = attacker_sensing_radius
             world.add_agent(agent)
-        
+
+        # Create a small static obstacle at the center of the arena
+        obstacle = Landmark(
+            name="obstacle",
+            shape=Sphere(radius=obstacle_radius),
+            color=obstacle_color,
+            collide=True,
+            movable=False,
+        )
+        world.add_landmark(obstacle)
+        self.obstacle = obstacle
+
         # Initialize tracking variables
         self.attacker_sensed = torch.zeros((batch_dim, num_attackers), dtype=torch.bool, device=device)
         self.attacker_captured = torch.zeros((batch_dim, num_attackers), dtype=torch.bool, device=device)
@@ -265,7 +283,17 @@ class Scenario(BaseScenario):
         # Get defenders and attackers
         defenders = [a for a in self.world.agents if a.is_defender]
         attackers = [a for a in self.world.agents if not a.is_defender]
-        
+
+        # Obstacle stays fixed at the center of the arena
+        obstacle_x = self._world_to_vmas(0.5)
+        obstacle_y = self._world_to_vmas(0.5)
+        if env_index is None:
+            self.obstacle.state.pos[:, X] = obstacle_x
+            self.obstacle.state.pos[:, Y] = obstacle_y
+        else:
+            self.obstacle.state.pos[env_index, X] = obstacle_x
+            self.obstacle.state.pos[env_index, Y] = obstacle_y
+
         # Position defenders at independent random points along the bottom
         # defense line (y=0), same style as the attacker's random spawn on the
         # top line - each defender gets its own independent draw, so they are
@@ -880,11 +908,45 @@ class Scenario(BaseScenario):
 
     def post_step(self):
         """
-        Called once per environment step, after the world has integrated
-        positions. Accumulates distance traveled per agent, using each
-        agent's current position vs. its position snapshotted at the end of
-        the previous post_step (or at episode reset).
+        Hard-stop collision with the center obstacle: called once per
+        environment step, after the world has integrated positions. Any
+        agent (defender or attacker) that penetrated the obstacle this step
+        is pushed back out to sit exactly on its boundary, and its velocity
+        is zeroed so it doesn't keep "pushing" into it.
+
+        This is deliberately independent of VMAS's built-in collision_force
+        (kept at 0 in make_world, as in target_defense_smart.py) so that
+        agent-vs-agent interactions are unaffected - only contact with the
+        obstacle itself is restricted.
         """
+        obstacle_pos = self.obstacle.state.pos  # [batch, 2]
+
+        for agent in self.world.agents:
+            agent_radius = getattr(agent.shape, "radius", 0.02)
+            min_dist = self.obstacle_radius + agent_radius
+
+            delta = agent.state.pos - obstacle_pos
+            dist = torch.norm(delta, dim=-1)
+            penetrating = dist < min_dist
+
+            if not penetrating.any():
+                continue
+
+            # Avoid division by zero for the (unlikely) case of an agent
+            # sitting exactly on the obstacle center; push it straight up.
+            safe_dist = torch.clamp(dist, min=1e-6)
+            direction = delta / safe_dist.unsqueeze(-1)
+            centered = dist < 1e-6
+            if centered.any():
+                direction[centered] = torch.tensor([0.0, 1.0], device=self.device)
+
+            clamped_pos = obstacle_pos + direction * min_dist
+            agent.state.pos[penetrating] = clamped_pos[penetrating]
+            agent.state.vel[penetrating] = 0.0
+
+        # Distance-traveled accumulation, using each agent's (possibly
+        # just-clamped) position vs. its position snapshotted at the end of
+        # the previous post_step (or at episode reset).
         defenders = [a for a in self.world.agents if a.is_defender]
         attackers = [a for a in self.world.agents if not a.is_defender]
 
@@ -1172,31 +1234,35 @@ if __name__ == "__main__":
     import vmas
     
     scenario = Scenario()
-    
-    # Test with smart attacker policy
+
+    # Test with smart attacker policy, two defenders, and a center obstacle
     env = vmas.make_env(
         scenario=scenario,
         num_envs=2,
         device="cpu",
         continuous_actions=True,
-        num_defenders=1,
+        num_defenders=2,
         num_attackers=1,
         sensing_radius=0.3,
         speed_ratio=0.3,
         fixed_attacker_policy=False,  # Smart policy enabled
         spawn_area_mode=True,
-        spawn_area_width=0.1
+        spawn_area_width=0.1,
+        obstacle_radius=0.03
     )
-    
-    print(f"V3 Environment created with {env.n_agents} agents")
+
+    print(f"V3 (w_obs) Environment created with {env.n_agents} agents")
     print(f"Smart attacker policy: {not scenario.fixed_attacker_policy}")
     print(f"Sensing radius: {scenario.sensing_radius}")
     print(f"Capture distance: {scenario.capture_distance}")
-    print("V3 Features:")
+    print(f"Obstacle radius: {scenario.obstacle_radius}")
+    print("V3 (w_obs) Features:")
     print("  - Attackers use Apollonius circle feedback loop when sensed")
     print("  - Attackers move straight down when not sensed")
     print("  - Dynamic escape route computation every step")
-    
+    print("  - Two defenders, both able to sense and pursue")
+    print("  - Small static obstacle at the center of the arena")
+
     obs = env.reset()
     print(f"Initial observations shape: {[o.shape for o in obs]}")
-    print("\n✓ V3 Environment with smart Apollonius-based attackers ready!")
+    print("\n✓ V3 (w_obs) Environment with smart Apollonius-based attackers ready!")
